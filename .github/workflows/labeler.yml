@@ -1,8 +1,11 @@
 name: labeler
 
+# Disabled on this fork: PR size labelling is upstream housekeeping we do not
+# need. Restore by uncommenting the pull_request_target block.
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  # pull_request_target:
+  #   types: [opened, synchronize, reopened]
 
 jobs:
   labeler:
