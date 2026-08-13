@@ -136,6 +136,31 @@ struct ProviderSettingsFields: View {
         appState.contextModel = trimmed
     }
 
+    /// Keeps the model field truthful when the provider changes: Sarvam cannot
+    /// serve Whisper IDs and the OpenAI-compatible providers cannot serve Sarvam
+    /// ones, so swap in the new provider's default instead of displaying a model
+    /// the request layer would silently substitute.
+    private func syncTranscriptionModel(for provider: TranscriptionProvider) {
+        let modelIsSarvam = SarvamTranscription.isSarvamModel(appState.transcriptionModel)
+        guard (provider == .sarvam) != modelIsSarvam else { return }
+        let defaultModel = provider == .sarvam
+            ? SarvamTranscription.defaultModel
+            : AppState.defaultTranscriptionModel
+        appState.transcriptionModel = defaultModel
+        transcriptionModelDraft = defaultModel
+    }
+
+    private var transcriptionProviderHelpText: String {
+        switch appState.transcriptionProviderPreference {
+        case .auto:
+            return "Picks Sarvam when the Transcription API URL points at sarvam.ai or the Transcription API Key is a Sarvam key, and the OpenAI-compatible API otherwise."
+        case .openAICompatible:
+            return "Always use the OpenAI-compatible /audio/transcriptions API."
+        case .sarvam:
+            return "Always use Sarvam's /speech-to-text API, whatever the key and URL look like."
+        }
+    }
+
     private func commitTranscriptionAPIURL() {
         let trimmed = transcriptionAPIURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
         transcriptionAPIURLInput = trimmed
@@ -252,13 +277,14 @@ struct ProviderSettingsFields: View {
             ModelDropdownView(
                 title: "Transcription Model",
                 subtitle: "Used for speech-to-text transcription.",
-                predefinedModels: ModelConfiguration.transcriptionModels,
-                defaultModel: AppState.defaultTranscriptionModel,
+                predefinedModels: appState.transcriptionModelOptionsForActiveProvider,
+                defaultModel: appState.defaultTranscriptionModelForActiveProvider,
                 textDraft: $transcriptionModelDraft,
                 onCommit: commitTranscriptionModel,
                 onReset: {
-                    transcriptionModelDraft = AppState.defaultTranscriptionModel
-                    appState.transcriptionModel = AppState.defaultTranscriptionModel
+                    let defaultModel = appState.defaultTranscriptionModelForActiveProvider
+                    transcriptionModelDraft = defaultModel
+                    appState.transcriptionModel = defaultModel
                 }
             )
 
@@ -273,6 +299,21 @@ struct ProviderSettingsFields: View {
                 .accessibilityLabel("Transcription Language")
                 .labelsHidden()
                 Text("Hint to the transcription model. Auto-detect works for most users. Pick a specific language if you see wrong-script characters (for example Chinese) appear in your output.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Transcription Provider")
+                    .font(.caption.weight(.semibold))
+                Picker("", selection: $appState.transcriptionProviderPreference) {
+                    ForEach(TranscriptionProviderPreference.allCases) { preference in
+                        Text(preference.displayName).tag(preference)
+                    }
+                }
+                .accessibilityLabel("Transcription Provider")
+                .labelsHidden()
+                Text(transcriptionProviderHelpText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -301,6 +342,9 @@ struct ProviderSettingsFields: View {
                         .font(.caption)
                     }
                 }
+                Text("Leave empty to reuse the API Base URL. Sarvam users can enter \(TranscriptionProvider.sarvamDefaultBaseURL), or leave this empty and that URL is used whenever Sarvam is the transcription provider.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -327,6 +371,16 @@ struct ProviderSettingsFields: View {
                         .font(.caption)
                     }
                 }
+            }
+
+            if appState.activeTranscriptionProvider == .sarvam {
+                Label {
+                    Text("Sarvam is active: audio goes to /speech-to-text with a Sarvam model ID (for example \(SarvamTranscription.defaultModel)). Realtime streaming does not apply and is skipped.")
+                } icon: {
+                    Image(systemName: "info.circle")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Divider()
@@ -378,6 +432,9 @@ struct ProviderSettingsFields: View {
             if !isEditingTranscriptionModel {
                 transcriptionModelDraft = value
             }
+        }
+        .onChange(of: appState.activeTranscriptionProvider) { provider in
+            syncTranscriptionModel(for: provider)
         }
         .onChange(of: appState.realtimeStreamingModel) { value in
             if !isEditingRealtimeStreamingModel {

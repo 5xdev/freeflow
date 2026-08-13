@@ -1,0 +1,127 @@
+name: Main Build (unsigned)
+
+# Builds an installable macOS app on every push to main WITHOUT any paid Apple
+# Developer resources: the bundle is ad-hoc signed (`codesign --sign -`), which
+# needs no certificate, no Team ID, and no notarization. The DMG is therefore
+# not notarized, so macOS quarantines it on download — the release notes below
+# tell you the one command that clears that.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: main-build
+  cancel-in-progress: true
+
+env:
+  APP_NAME: FreeFlow
+  BUNDLE_ID: com.zachlatta.freeflow
+  RELEASE_TAG: main-build
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build version
+        id: version
+        run: |
+          BASE_VERSION="$(plutil -extract CFBundleShortVersionString raw Info.plist)"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+
+          echo "version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "build_tag=main-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp app version
+        run: |
+          plutil -replace CFBundleShortVersionString -string "${{ steps.version.outputs.version }}" Info.plist
+          plutil -replace CFBundleVersion -string "${{ github.run_number }}" Info.plist
+          plutil -replace FreeFlowBuildTag -string "${{ steps.version.outputs.build_tag }}" Info.plist
+
+      # Ad-hoc signature ("-"): no Apple account of any kind is involved. The
+      # app still gets a valid code signature, which macOS needs before it will
+      # grant microphone and accessibility permissions.
+      - name: Build universal app (ad-hoc signed)
+        run: |
+          make ARCH=universal \
+            APP_NAME="$APP_NAME" \
+            BUNDLE_ID="$BUNDLE_ID" \
+            CODESIGN_IDENTITY=-
+
+      - name: Verify signature and architectures
+        run: |
+          codesign --verify --deep --strict --verbose=2 "build/$APP_NAME.app"
+          lipo -info "build/$APP_NAME.app/Contents/MacOS/$APP_NAME"
+
+      # Built with hdiutil rather than `make dmg` so the job needs no Homebrew
+      # packages and no Finder scripting (both are unreliable on CI runners).
+      - name: Create DMG
+        run: |
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          cp -R "build/$APP_NAME.app" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          hdiutil create \
+            -volname "$APP_NAME" \
+            -srcfolder "$STAGING" \
+            -fs HFS+ \
+            -format UDZO \
+            -ov \
+            "$APP_NAME.dmg"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeFlow-macOS-${{ steps.version.outputs.short_sha }}
+          path: FreeFlow.dmg
+          retention-days: 30
+          if-no-files-found: error
+
+      # A rolling tag means the download URL never changes:
+      # .../releases/download/main-build/FreeFlow.dmg
+      - name: Move rolling tag
+        run: |
+          git tag --force "$RELEASE_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: FreeFlow main ${{ steps.version.outputs.short_sha }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: false
+          files: FreeFlow.dmg
+          body: |
+            Unsigned (ad-hoc signed) build of `main` at `${{ github.sha }}`.
+
+            **[Download FreeFlow.dmg](https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/FreeFlow.dmg)** — universal binary (Apple Silicon + Intel), macOS 13+.
+
+            ### Install
+
+            1. Open the DMG and drag **FreeFlow** to **Applications**.
+            2. Clear the download quarantine flag — this build is not notarized, so macOS blocks it until you do:
+
+               ```sh
+               xattr -dr com.apple.quarantine /Applications/FreeFlow.app
+               ```
+
+            3. Launch it. FreeFlow is a menu bar app (no Dock icon). Grant microphone and accessibility access when prompted.
+
+            ### Notes
+
+            - Because each build carries a fresh ad-hoc signature, macOS treats every update as a new app: you will need to re-grant microphone and accessibility permissions after installing a new build (System Settings → Privacy & Security).
+            - If you skip step 2, macOS reports the app as damaged or from an unidentified developer.

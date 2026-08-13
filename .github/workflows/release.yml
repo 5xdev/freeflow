@@ -1,9 +1,14 @@
 name: Release
 
+# Disabled on this fork: this workflow needs a paid Apple Developer ID
+# certificate and notarization credentials, which we do not have. Left
+# manual-only so it can still be run by hand if those secrets are ever
+# configured; restore the automatic trigger by uncommenting the push block.
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - "v*.*.*"
 
 permissions:
   contents: write
