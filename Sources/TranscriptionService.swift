@@ -16,6 +16,7 @@ class TranscriptionService {
 
     private let apiKey: String
     private let baseURL: URL
+    private let provider: TranscriptionProvider
     private let transcriptionModel: String
     private let language: String?
     private var transcriptionResponseFormat: String {
@@ -30,14 +31,29 @@ class TranscriptionService {
         apiKey: String,
         baseURL: String = "https://api.groq.com/openai/v1",
         transcriptionModel: String = "whisper-large-v3",
-        language: String? = nil
+        language: String? = nil,
+        provider: TranscriptionProvider = .openAICompatible
     ) throws {
         self.apiKey = apiKey
         self.baseURL = try Self.normalizedBaseURL(from: baseURL)
+        self.provider = provider
         let trimmedModel = transcriptionModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.transcriptionModel = trimmedModel.isEmpty ? "whisper-large-v3" : trimmedModel
+        let defaultedModel = trimmedModel.isEmpty ? "whisper-large-v3" : trimmedModel
+        self.transcriptionModel = provider == .sarvam
+            ? SarvamTranscription.resolvedModel(defaultedModel)
+            : defaultedModel
         let trimmedLanguage = language?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.language = (trimmedLanguage?.isEmpty == false) ? trimmedLanguage : nil
+    }
+
+    /// The endpoint a request would be sent to, for a raw (un-normalized) base
+    /// URL string. Throws the same `invalidBaseURL` errors as `init`.
+    static func transcriptionEndpointURL(
+        baseURL: String,
+        provider: TranscriptionProvider
+    ) throws -> URL {
+        let normalized = try normalizedBaseURL(from: baseURL)
+        return provider.transcriptionEndpoint(baseURL: normalized)
     }
 
     static func responseFormat(forModel model: String) -> String {
@@ -46,10 +62,19 @@ class TranscriptionService {
     }
 
     // Validate API key by hitting a lightweight endpoint
-    static func validateAPIKey(_ key: String, baseURL: String = "https://api.groq.com/openai/v1") async -> Bool {
+    static func validateAPIKey(
+        _ key: String,
+        baseURL: String = "https://api.groq.com/openai/v1",
+        provider: TranscriptionProvider = .openAICompatible
+    ) async -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard let baseURL = try? normalizedBaseURL(from: baseURL) else { return false }
+
+        // Sarvam has no cheap listing endpoint equivalent to GET /models, and
+        // probing one 404s whatever the key is. Accept a well-formed key here; a
+        // bad one surfaces as a friendly 401 on the first transcription instead.
+        guard provider != .sarvam else { return true }
 
         var request = URLRequest(url: baseURL.appendingPathComponent("models"))
         request.timeoutInterval = 10
@@ -115,23 +140,31 @@ class TranscriptionService {
     }
 
     private func transcribeAudioWithURLSession(fileURL: URL) async throws -> String {
-        let url = baseURL
-            .appendingPathComponent("audio")
-            .appendingPathComponent("transcriptions")
+        let url = provider.transcriptionEndpoint(baseURL: baseURL)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = transcriptionTimeoutSeconds
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(
+            provider.authorizationHeaderValue(apiKey: apiKey),
+            forHTTPHeaderField: provider.authorizationHeaderName
+        )
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         let audioData = try Data(contentsOf: fileURL)
-        let body = makeMultipartBody(
+        let fileName = fileURL.lastPathComponent
+        let body = Self.makeMultipartBody(
             audioData: audioData,
-            fileName: fileURL.lastPathComponent,
-            model: transcriptionModel,
-            responseFormat: transcriptionResponseFormat,
-            language: language,
+            fileName: fileName,
+            contentType: Self.audioContentType(for: fileName),
+            fields: Self.formFields(
+                provider: provider,
+                model: transcriptionModel,
+                responseFormat: transcriptionResponseFormat,
+                language: language,
+                inputAudioCodec: SarvamTranscription.inputAudioCodec(),
+                sampleRate: SarvamTranscription.sampleRate()
+            ),
             boundary: boundary
         )
 
@@ -178,7 +211,7 @@ class TranscriptionService {
 
         return try parseTranscript(from: data)
     }
-    private func audioContentType(for fileName: String) -> String {
+    static func audioContentType(for fileName: String) -> String {
         if fileName.lowercased().hasSuffix(".wav") {
             return "audio/wav"
         }
@@ -196,12 +229,49 @@ class TranscriptionService {
         return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
     }
 
-    private func makeMultipartBody(
-        audioData: Data,
-        fileName: String,
+    /// The text form fields that accompany the audio file, in the order the
+    /// provider's docs use. Sarvam takes a different set entirely: it has no
+    /// `response_format`, and its language field is `language_code` carrying a
+    /// regional code rather than a bare ISO 639-1 one.
+    static func formFields(
+        provider: TranscriptionProvider,
         model: String,
         responseFormat: String,
         language: String?,
+        inputAudioCodec: String?,
+        sampleRate: String?
+    ) -> [(name: String, value: String)] {
+        switch provider {
+        case .openAICompatible:
+            var fields: [(name: String, value: String)] = [
+                (name: "model", value: model),
+                (name: "response_format", value: responseFormat)
+            ]
+            if let language, !language.isEmpty {
+                fields.append((name: "language", value: language))
+            }
+            return fields
+        case .sarvam:
+            var fields: [(name: String, value: String)] = [
+                (name: "model", value: model),
+                (name: "language_code", value: SarvamTranscription.languageCode(for: language)),
+                (name: "mode", value: SarvamTranscription.mode)
+            ]
+            if let inputAudioCodec, !inputAudioCodec.isEmpty {
+                fields.append((name: "input_audio_codec", value: inputAudioCodec))
+            }
+            if let sampleRate, !sampleRate.isEmpty {
+                fields.append((name: "sample_rate", value: sampleRate))
+            }
+            return fields
+        }
+    }
+
+    static func makeMultipartBody(
+        audioData: Data,
+        fileName: String,
+        contentType: String,
+        fields: [(name: String, value: String)],
         boundary: String
     ) -> Data {
         var body = Data()
@@ -210,23 +280,15 @@ class TranscriptionService {
             body.append(Data(value.utf8))
         }
 
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-        append("\(model)\r\n")
-
-        append("--\(boundary)\r\n")
-        append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n")
-        append("\(responseFormat)\r\n")
-
-        if let language, !language.isEmpty {
+        for field in fields {
             append("--\(boundary)\r\n")
-            append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
-            append("\(language)\r\n")
+            append("Content-Disposition: form-data; name=\"\(field.name)\"\r\n\r\n")
+            append("\(field.value)\r\n")
         }
 
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
-        append("Content-Type: \(audioContentType(for: fileName))\r\n\r\n")
+        append("Content-Type: \(contentType)\r\n\r\n")
         body.append(audioData)
         append("\r\n")
         append("--\(boundary)--\r\n")
@@ -250,6 +312,8 @@ class TranscriptionService {
             return "Audio file too large for \(provider) (HTTP 413). Try a shorter recording."
         case 400:
             return "Provider rejected the request (HTTP 400). Check your model name and Base URL in Settings."
+        case 422:
+            return "Provider rejected the request (HTTP 422). Check the transcription model and language settings for \(provider)."
         case 429:
             return "Rate limit reached at \(provider) (HTTP 429). Wait a moment and try again."
         case 500..<600:
@@ -328,9 +392,17 @@ class TranscriptionService {
 
     private let hallucinationNoSpeechThreshold = 0.1
 
+    /// Providers disagree on the transcript field name: OpenAI-compatible APIs
+    /// return `text`, Sarvam returns `transcript`.
+    static func transcriptText(from json: [String: Any]) -> String? {
+        if let text = json["text"] as? String { return text }
+        if let transcript = json["transcript"] as? String { return transcript }
+        return nil
+    }
+
     private func parseTranscript(from data: Data) throws -> String {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let text = json["text"] as? String {
+           let text = Self.transcriptText(from: json) {
             if isHallucination(text: text, json: json) {
                 return ""
             }

@@ -203,6 +203,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let transcriptionModelStorageKey = "transcription_model"
     private let transcriptionAPIURLStorageKey = "transcription_api_url"
     private let transcriptionAPIKeyStorageKey = "transcription_api_key"
+    private let transcriptionProviderStorageKey = "transcription_provider"
     private let postProcessingModelStorageKey = "post_processing_model"
     private let postProcessingFallbackModelStorageKey = "post_processing_fallback_model"
     private let contextModelStorageKey = "context_model"
@@ -313,6 +314,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var transcriptionAPIKey: String {
         didSet {
             persistOptionalAPIValue(transcriptionAPIKey, account: transcriptionAPIKeyStorageKey)
+        }
+    }
+
+    @Published var transcriptionProviderPreference: TranscriptionProviderPreference {
+        didSet {
+            UserDefaults.standard.set(
+                transcriptionProviderPreference.rawValue,
+                forKey: transcriptionProviderStorageKey
+            )
         }
     }
 
@@ -634,6 +644,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let transcriptionModel = UserDefaults.standard.string(forKey: transcriptionModelStorageKey) ?? Self.defaultTranscriptionModel
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
+        let transcriptionProviderPreference = TranscriptionProviderPreference(
+            rawValue: UserDefaults.standard.string(forKey: transcriptionProviderStorageKey) ?? ""
+        ) ?? .auto
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
         let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
             key: postProcessingFallbackModelStorageKey
@@ -738,6 +751,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.apiBaseURL = apiBaseURL
         self.transcriptionAPIURL = transcriptionAPIURL
         self.transcriptionAPIKey = transcriptionAPIKey
+        self.transcriptionProviderPreference = transcriptionProviderPreference
         self.transcriptionModel = transcriptionModel
         self.postProcessingModel = postProcessingModel
         self.postProcessingFallbackModel = postProcessingFallbackModel
@@ -1021,22 +1035,43 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return normalized
     }
 
-    private var resolvedTranscriptionBaseURL: String {
-        let trimmed = transcriptionAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? apiBaseURL : trimmed
+    /// The provider, URL, and key transcription actually uses. Both the URL and
+    /// the key fall back to the general API settings when left empty, except
+    /// when that would send a Sarvam key to an OpenAI-compatible provider.
+    var resolvedTranscriptionEndpoint: ResolvedTranscriptionEndpoint {
+        TranscriptionProvider.resolveEndpoint(
+            preference: transcriptionProviderPreference,
+            transcriptionAPIURL: transcriptionAPIURL,
+            transcriptionAPIKey: transcriptionAPIKey,
+            fallbackBaseURL: apiBaseURL,
+            fallbackAPIKey: apiKey
+        )
     }
 
-    private var resolvedTranscriptionAPIKey: String {
-        let trimmed = transcriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? apiKey : trimmed
+    var activeTranscriptionProvider: TranscriptionProvider {
+        resolvedTranscriptionEndpoint.provider
+    }
+
+    var defaultTranscriptionModelForActiveProvider: String {
+        activeTranscriptionProvider == .sarvam
+            ? SarvamTranscription.defaultModel
+            : Self.defaultTranscriptionModel
+    }
+
+    var transcriptionModelOptionsForActiveProvider: [String] {
+        activeTranscriptionProvider == .sarvam
+            ? ModelConfiguration.sarvamTranscriptionModels
+            : ModelConfiguration.transcriptionModels
     }
 
     func makeTranscriptionService() throws -> TranscriptionService {
-        try TranscriptionService(
-            apiKey: resolvedTranscriptionAPIKey,
-            baseURL: resolvedTranscriptionBaseURL,
+        let endpoint = resolvedTranscriptionEndpoint
+        return try TranscriptionService(
+            apiKey: endpoint.apiKey,
+            baseURL: endpoint.baseURL,
             transcriptionModel: transcriptionModel,
-            language: resolvedTranscriptionLanguage
+            language: resolvedTranscriptionLanguage,
+            provider: endpoint.provider
         )
     }
 
@@ -2928,7 +2963,20 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     private func startRealtimeStreamingIfEnabled() {
         guard realtimeStreamingEnabled else { return }
-        let trimmedBase = resolvedTranscriptionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpoint = resolvedTranscriptionEndpoint
+        // Sarvam streams over its own protocol, not the OpenAI-compatible
+        // /v1/realtime socket this service speaks. Skip it and let the upload
+        // path handle the recording instead of opening a socket that never
+        // emits a transcript.
+        guard endpoint.provider != .sarvam else {
+            os_log(
+                .info,
+                log: recordingLog,
+                "realtime streaming skipped: Sarvam endpoints use a different streaming protocol"
+            )
+            return
+        }
+        let trimmedBase = endpoint.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBase.isEmpty else {
             os_log(.info, log: recordingLog, "realtime streaming requested but base URL is empty — skipping")
             return
@@ -2936,7 +2984,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let model = realtimeStreamingModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let config = RealtimeTranscriptionService.Configuration(
             baseURL: trimmedBase,
-            apiKey: resolvedTranscriptionAPIKey,
+            apiKey: endpoint.apiKey,
             model: model,
             language: resolvedTranscriptionLanguage
         )

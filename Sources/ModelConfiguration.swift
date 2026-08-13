@@ -29,6 +29,12 @@ public struct ModelConfiguration {
         "whisper-large-v3-turbo"
     ]
 
+    /// Offered in place of the Whisper models when transcription is pointed at
+    /// Sarvam, whose speech-to-text endpoint only serves its own model IDs.
+    public static let sarvamTranscriptionModels = [
+        "saaras:v4"
+    ]
+
     public static func config(for model: String) -> ModelConfig {
         var cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         

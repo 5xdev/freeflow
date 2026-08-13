@@ -39,6 +39,7 @@ FreeFlow is a free Mac dictation app inspired by [Wispr Flow](https://wisprflow.
 - **Context-aware cleanup:** FreeFlow can read nearby app context so names, terms, and phrases are spelled correctly when you dictate into email, terminals, docs, and other apps.
 - **Custom vocabulary:** Add names, jargon, and project-specific words that FreeFlow should preserve during cleanup.
 - **OpenAI-compatible providers:** Use Groq by default, or configure a custom model and API URL in settings.
+- **Sarvam transcription:** Point transcription at Sarvam's speech-to-text API for Indic languages while cleanup keeps running on your OpenAI-compatible LLM provider.
 
 ## Edit Mode
 
@@ -81,6 +82,27 @@ Then your response would be ONLY the cleaned up text, so here your response is O
 FreeFlow can use OpenAI-compatible local or self-hosted providers instead of Groq. In settings, configure the API base URL and model IDs for your local LLM provider, such as Ollama, LM Studio, or another OpenAI-compatible server. If your transcription backend uses a different endpoint from your LLM backend, set the transcription API URL separately.
 
 Local models are often slower than hosted providers, especially on cold start, long recordings, or busy hardware.
+
+## Using Sarvam for Transcription
+
+FreeFlow can send audio to [Sarvam](https://www.sarvam.ai/)'s speech-to-text API instead of an OpenAI-compatible one, while transcript cleanup keeps running on whichever LLM provider your API Base URL points at.
+
+In Settings, under Advanced Provider Settings:
+
+1. Paste your Sarvam subscription key into **Transcription API Key**.
+2. Leave **Transcription API URL** empty to use `https://api.sarvam.ai`, or enter it (or the full `https://api.sarvam.ai/speech-to-text`) yourself.
+3. Set **Transcription Model** to a Sarvam model ID, such as `saaras:v4`.
+
+**Transcription Provider** is set to Auto-detect by default, which picks Sarvam when the URL points at `sarvam.ai` or the key is a Sarvam key. Pick Sarvam explicitly if auto-detection does not recognize your key.
+
+FreeFlow uploads a 16 kHz mono PCM16 WAV, so it sends `input_audio_codec=wav` and `sample_rate=16000`. Override them if you need to:
+
+```bash
+defaults write com.zachlatta.freeflow sarvam_input_audio_codec -string "pcm_s16le"
+defaults write com.zachlatta.freeflow sarvam_sample_rate -string "8000"
+```
+
+Set either to an empty string to omit the field and let Sarvam auto-detect. Realtime streaming uses the OpenAI-compatible `/v1/realtime` WebSocket and is skipped automatically while Sarvam is the transcription provider.
 
 <details>
   <summary>Configure longer timeouts for local models</summary>
